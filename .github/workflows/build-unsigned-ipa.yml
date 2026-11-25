@@ -1,0 +1,145 @@
+name: build-unsigned-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/build-unsigned-ipa.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-unsigned-ipa
+  cancel-in-progress: true
+
+jobs:
+  ipa:
+    name: Build unsigned iOS IPA
+    runs-on: macos-26
+    timeout-minutes: 150
+    env:
+      NODE_OPTIONS: "--max-old-space-size=8192"
+      PLUS_STORE_GATE: "false"
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        run: |
+          sudo xcode-select -s /Applications/Xcode.app
+          xcodebuild -version
+          df -h /
+
+      - name: Ensure Metal toolchain
+        run: |
+          xcrun -sdk iphoneos metal -v || xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk iphoneos metal -v
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22.21.0"
+          cache: "yarn"
+
+      - name: Install JS dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Restore enriched-markdown native assets
+        run: INIT_CWD="$GITHUB_WORKSPACE" node node_modules/react-native-enriched-markdown/postinstall.mjs
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.2.3"
+          bundler-cache: true
+
+      - name: Placeholder config (no real secrets)
+        run: |
+          cp .env.example .env
+          cat > ios/Config/Env.xcconfig <<'EOL'
+          // Placeholder values for an unsigned community build.
+          GOOGLE_WEB_CLIENT_ID = placeholder.apps.googleusercontent.com
+          REVERSED_GOOGLE_IOS_CLIENT_ID = com.googleusercontent.apps.placeholder
+          EOL
+          cat > ios/GoogleService-Info.plist <<'EOL'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>API_KEY</key><string>AIzaSyA00000000000000000000000000000000</string>
+            <key>GCM_SENDER_ID</key><string>000000000000</string>
+            <key>PLIST_VERSION</key><string>1</string>
+            <key>BUNDLE_ID</key><string>ai.pocketpal</string>
+            <key>PROJECT_ID</key><string>placeholder-project</string>
+            <key>STORAGE_BUCKET</key><string>placeholder-project.appspot.com</string>
+            <key>IS_ADS_ENABLED</key><false/>
+            <key>IS_ANALYTICS_ENABLED</key><false/>
+            <key>IS_APPINVITE_ENABLED</key><false/>
+            <key>IS_GCM_ENABLED</key><false/>
+            <key>IS_SIGNIN_ENABLED</key><false/>
+            <key>GOOGLE_APP_ID</key><string>1:000000000000:ios:0000000000000000000000</string>
+          </dict>
+          </plist>
+          EOL
+          plutil -lint ios/GoogleService-Info.plist
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: bundle exec pod install
+
+      - name: Archive iOS (unsigned)
+        working-directory: ios
+        run: |
+          set +e
+          xcodebuild archive -workspace PocketPal.xcworkspace -scheme PocketPal \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/PocketPal.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            > "$GITHUB_WORKSPACE/archive-ios.log" 2>&1
+          rc=$?
+          grep -E "error:|\*\* ARCHIVE" "$GITHUB_WORKSPACE/archive-ios.log" | head -n 80
+          if [ $rc -ne 0 ]; then tail -n 150 "$GITHUB_WORKSPACE/archive-ios.log"; exit $rc; fi
+
+      - name: Package IPA
+        run: |
+          set -e
+          APP=$(find "$RUNNER_TEMP/PocketPal.xcarchive/Products/Applications" -maxdepth 1 -name "*.app" | head -1)
+          echo "App: $APP"
+          test -n "$APP"
+          /usr/libexec/PlistBuddy -c "Print CFBundleIdentifier" -c "Print CFBundleShortVersionString" -c "Print CFBundleVersion" -c "Print MinimumOSVersion" "$APP/Info.plist"
+          ls "$APP/PlugIns" 2>/dev/null || echo "no app extensions"
+          mkdir -p ipa/Payload
+          cp -R "$APP" ipa/Payload/
+          cd ipa
+          zip -qry ../PocketPal.ipa Payload
+          cd ..
+          ls -la PocketPal.ipa
+          shasum -a 256 PocketPal.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PocketPal-ipa
+          path: PocketPal.ipa
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ipa-unsigned-v1.24.0
+          name: PocketPal AI v1.24.0 unsigned IPA
+          body: Unsigned iOS IPA built by GitHub Actions from upstream a-ghorbani/pocketpal-ai v1.24.0 source. Sign it with your own Apple ID via Sideloadly or AltStore. Placeholder Firebase/Google config, so benchmark upload and Google sign-in will not work.
+          files: PocketPal.ipa
+          make_latest: true
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ipa-build-logs
+          path: "*.log"
+          if-no-files-found: ignore
